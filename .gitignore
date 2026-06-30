@@ -1,0 +1,36 @@
+# reCamera Pro C++ SDK — .gitignore
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+build-*/
+build/
+*.o
+
+# ── Heavy assets — managed via GitHub Releases ────────────────────────────────
+# These are NOT committed to the repo. Download from:
+#   https://github.com/your-org/reCamera-Pro-SDK/releases
+#
+# Contents:
+#   releases_archive/linux-ipc-tools-toolchain-aarch64-*   (~600MB toolchain)
+#   releases_archive/linux-ipc-tools-toolchain-arm-*       (~500MB toolchain)
+#   releases_archive/linux-ipc-docs-rv1126b-*              (~700MB docs)
+#   releases_archive/reference_code/                       (~260MB reference)
+releases_archive/
+
+# ── IDE / editor ─────────────────────────────────────────────────────────────
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── CMake generated ───────────────────────────────────────────────────────────
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
