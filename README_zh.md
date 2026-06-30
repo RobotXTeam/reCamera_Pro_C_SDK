@@ -185,7 +185,7 @@ reCamera_Pro_C++_SDK/
 │   ├── sensor/                 imu.hpp
 │   ├── system/                 sysinfo.hpp, watchdog.hpp
 │   └── network/                netconfig.hpp
-├── src/                        SDK 库的具体实现 (~25 个 .cpp 文件)
+├── lib/                        预编译的 SDK 二进制黑盒库 (libreCamera_pro_sdk.so))
 ├── examples/                   12 个独立的演示程序
 │   ├── hello_world/            SDK 版本信息 + 系统信息
 │   ├── gpio_control/           LED 闪烁 + 输入轮询

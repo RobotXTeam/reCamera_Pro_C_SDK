@@ -185,7 +185,7 @@ reCamera_Pro_C++_SDK/
 │   ├── sensor/                 imu.hpp
 │   ├── system/                 sysinfo.hpp, watchdog.hpp
 │   └── network/                netconfig.hpp
-├── src/                        SDK library implementation (~25 .cpp files)
+├── lib/                        Precompiled SDK binary black-box library (libreCamera_pro_sdk.so)
 ├── examples/                   12 standalone demo programs
 │   ├── hello_world/            SDK version + system info
 │   ├── gpio_control/           LED blink + input poll
