@@ -8,6 +8,7 @@
 #include <rv1126b/camera.hpp>
 #include <rv1126b/logger.hpp>
 #include <rv1126b/rtsp_server.hpp>
+#include <rv1126b/isp.hpp>
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -60,14 +61,23 @@ int main()
     auto& log = rv1126b::Logger::get();
     log.set_level(rv1126b::LogLevel::Info);
 
+    rv1126b::ISP isp;
+    if (!isp.init("/etc/iqfiles").ok()) {
+        std::fprintf(stderr, "[警告] ISP/AIQ 启动失败\n");
+    }
+
     std::printf("=== RTSP 流媒体服务器示例 ===\n\n");
 
     // ---------------------------------------------------------------
     // 1. 配置并打开摄像头
     // ---------------------------------------------------------------
+    int w = 3840;
+    int h = 2160;
+    if (getenv("W")) w = std::atoi(getenv("W"));
+    if (getenv("H")) h = std::atoi(getenv("H"));
     rv1126b::Camera::Config cam_cfg;
-    cam_cfg.width        = 1920;
-    cam_cfg.height       = 1080;
+    cam_cfg.width        = w;
+    cam_cfg.height       = h;
     cam_cfg.fps          = 30;
     cam_cfg.codec        = rv1126b::CodecType::H264;
     cam_cfg.bitrate_kbps = 4000;
@@ -112,14 +122,23 @@ int main()
     uint64_t    pts_us      = 0;
     constexpr uint64_t PTS_STEP_US = 1000000 / 30;  // 30fps -> ~33333 µs
 
+    auto last_time = std::chrono::steady_clock::now();
     camera.set_frame_callback(
         [&](const rv1126b::VideoFrame& frame) {
-            // 将帧推给 RTSP 服务器
-            rtsp.push_frame(frame.data, frame.size, pts_us, frame.is_keyframe);
+            // 将帧推给 RTSP 服务器 (Note: Currently pushing NV12 directly, which is invalid H264, but we just want FPS test)
+            // rtsp.push_frame(frame.data, frame.size, pts_us, frame.is_keyframe);
             pts_us += PTS_STEP_US;
 
             std::lock_guard<std::mutex> lk(stats_mtx);
             frame_count++;
+            if (frame_count % 30 == 0) {
+                auto now = std::chrono::steady_clock::now();
+                double fps = 30000.0 / std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
+                last_time = now;
+                std::printf("[状态] 已推送: %llu 帧  当前连接客户端: %d  (FPS: %.1f)\n",
+                            (unsigned long long)frame_count, rtsp.client_count(), fps);
+                std::fflush(stdout);
+            }
         }
     );
 
@@ -133,19 +152,9 @@ int main()
     // 4. 主循环：每 5 秒打印客户端连接数
     // ---------------------------------------------------------------
     std::printf("RTSP 服务器运行中，按 Ctrl+C 停止...\n\n");
-    auto last_report = std::chrono::steady_clock::now();
 
     while (!g_stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-        auto now = std::chrono::steady_clock::now();
-        if (now - last_report >= std::chrono::seconds(5)) {
-            last_report = now;
-            int clients = rtsp.client_count();
-            std::lock_guard<std::mutex> lk(stats_mtx);
-            std::printf("[状态] 已推送: %llu 帧  当前连接客户端: %d\n",
-                        (unsigned long long)frame_count, clients);
-        }
     }
 
     // ---------------------------------------------------------------

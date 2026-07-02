@@ -86,6 +86,12 @@ int main()
         std::printf("正在抓取原始 NV12 帧...\n");
 
         // 启动摄像头以获取回调帧
+        // WORKAROUND: 关闭并重新打开摄像头，避免前一次 capture_jpeg 导致的 VIDIOC_STREAMON 失败
+        camera.close();
+        if (!camera.open(cfg).ok()) {
+            std::fprintf(stderr, "[错误] 重新打开摄像头失败\n");
+        }
+
         auto start_res = camera.start();
         if (!start_res.ok()) {
             std::fprintf(stderr, "[警告] 摄像头启动失败，跳过 NV12 演示\n");
@@ -133,6 +139,12 @@ int main()
     if (!g_stop.load()) {
         constexpr const char* SNAP2 = "/tmp/snapshot2.jpg";
         std::printf("\n正在抓取第二张快照 -> %s ...\n", SNAP2);
+
+        // WORKAROUND: 关闭并重新打开摄像头
+        camera.close();
+        if (!camera.open(cfg).ok()) {
+            std::fprintf(stderr, "[错误] 重新打开摄像头失败\n");
+        }
 
         auto snap2_res = camera.capture_jpeg(SNAP2);
         if (snap2_res.ok()) {

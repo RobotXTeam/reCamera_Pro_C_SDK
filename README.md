@@ -57,7 +57,7 @@ Deploy and run `hello_world` on the device:
 
 ```bash
 # Deploy SDK library (first time only)
-scp build-aarch64/src/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
+scp lib/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
 ssh root@192.168.x.xx "ln -sf /tmp/libreCamera_pro_sdk.so.1.0.0 /tmp/libreCamera_pro_sdk.so.1"
 
 # Deploy and run the demo
@@ -205,7 +205,8 @@ reCamera_Pro_C++_SDK/
 │   └── build.sh                One-command cross-compilation script
 ├── tools/
 │   ├── deploy.sh               Deploy binary to device via SCP
-│   └── device_info.sh          Query device hardware info
+│   ├── device_info.sh          Query device hardware info
+│   └── demo_env.sh             (Run on device) Toggle rkipc camera services
 └── tests/                      Unit / integration tests (placeholder)
 ```
 
@@ -216,7 +217,7 @@ reCamera_Pro_C++_SDK/
 ### Deploy the SDK shared library (required once per device)
 
 ```bash
-scp build-aarch64/src/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
+scp lib/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
 ssh root@192.168.x.xx "ln -sf /tmp/libreCamera_pro_sdk.so.1.0.0 /tmp/libreCamera_pro_sdk.so.1"
 ```
 
@@ -247,16 +248,22 @@ The `LD_LIBRARY_PATH` prefix allows the dynamic linker to find:
 - SDK library (`libreCamera_pro_sdk.so.1`) in `/tmp`
 - Rockchip platform libraries (`librknnrt.so`, `librkaiq.so`, `librga.so`, `librockchip_mpp.so`) in `/oem/usr/lib`
 
-### Managing rkipc
+### Managing rkipc and Global Library Deployment
 
-Most camera demos require the system camera process (`rkipc`) to be stopped first because it holds `/dev/video13`:
+Most camera demos require the system camera process (`rkipc`) to be stopped first because it holds `/dev/video13`.
+
+We provide an interactive host-side script `tools/demo_env.sh` that automates everything: it stops the service, creates a `/lib_c++` directory on the device, sets up global dynamic linking via `ld.so.conf`, and uploads the SDK library.
 
 ```bash
-# Stop before running camera demos
-/oem/usr/bin/RkLunch-stop.sh
+# Run on your PC (Host):
+./tools/demo_env.sh 0
+# Follow the prompts for IP and credentials.
+# Note: For the first time, it deploys the library. On subsequent runs, it smartly skips deployment and just stops rkipc.
+# Once done, you can SSH into the device and run `./hello_world` directly without exporting LD_LIBRARY_PATH!
 
-# Restart after testing
-/oem/usr/bin/RkLunch.sh
+# Restart rkipc after testing (Run on your PC):
+./tools/demo_env.sh 1
+# This restores the camera service but retains the /lib_c++ environment for future use.
 ```
 
 The `isp_control` demo is the exception — it needs rkipc **running** to access the rkaiq context.

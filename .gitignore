@@ -34,3 +34,6 @@ compile_commands.json
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
+
+# Ignored private source symlink
+private_src/

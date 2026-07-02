@@ -1,0 +1,958 @@
+// Copyright (c) 2024 RV1126B SDK Project
+// SPDX-License-Identifier: MIT
+//
+// rknn_yolo — RKNN YOLOX-S 目标检测示例 + OSD MJPEG UDP preview stream
+// 使用原生 rknn_api.h 解析 9 个输出张量，通过 UDP 分片输出 MJPEG 预览帧。
+
+#include <rv1126b/camera.hpp>
+#include <rv1126b/isp.hpp>
+#include <rv1126b/logger.hpp>
+#include <rknn/rknn_api.h>
+
+extern "C" {
+#include <rockchip/rk_mpi.h>
+#include <rockchip/mpp_buffer.h>
+#include <rockchip/mpp_frame.h>
+#include <rockchip/mpp_packet.h>
+#include <rockchip/rk_venc_cfg.h>
+#include <rockchip/rk_venc_cmd.h>
+#include <rockchip/rk_venc_rc.h>
+}
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
+#include <cmath>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <fstream>
+#include <ifaddrs.h>
+#include <mutex>
+#include <unistd.h>
+
+static std::atomic<bool> g_stop{false};
+
+static constexpr uint32_t align16(uint32_t v) {
+    return (v + 15U) & ~15U;
+}
+
+static void signal_handler(int /*sig*/) {
+    g_stop.store(true, std::memory_order_relaxed);
+}
+
+static std::string get_device_ip() {
+    struct ifaddrs* ifas = nullptr;
+    if (getifaddrs(&ifas) != 0) return "127.0.0.1";
+    std::string result = "127.0.0.1";
+    for (auto* ifa = ifas; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (std::string(ifa->ifa_name) == "lo") continue;
+        char buf[INET_ADDRSTRLEN];
+        auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
+            result = buf;
+            break;
+        }
+    }
+    freeifaddrs(ifas);
+    return result;
+}
+
+static bool has_local_ip(const std::string& ip) {
+    struct ifaddrs* ifas = nullptr;
+    if (getifaddrs(&ifas) != 0) return false;
+    bool found = false;
+    for (auto* ifa = ifas; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        char buf[INET_ADDRSTRLEN];
+        auto* sin = reinterpret_cast<struct sockaddr_in*>(ifa->ifa_addr);
+        if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) && ip == buf) {
+            found = true;
+            break;
+        }
+    }
+    freeifaddrs(ifas);
+    return found;
+}
+
+static std::string pick_source_ip() {
+    if (has_local_ip("192.168.2.166")) return "192.168.2.166";
+    return get_device_ip();
+}
+
+static int env_int(const char* name, int fallback, int min_v, int max_v) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) return fallback;
+    char* end = nullptr;
+    long parsed = std::strtol(v, &end, 10);
+    if (end == v || parsed < min_v || parsed > max_v) return fallback;
+    return static_cast<int>(parsed);
+}
+
+static std::string env_string(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::string(v) : std::string(fallback);
+}
+
+static const char* COCO_CLASSES[] = {
+    "person","bicycle","car","motorcycle","airplane","bus","train","truck",
+    "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
+    "bird","cat","dog","horse","sheep","cow","elephant","bear","zebra","giraffe",
+    "backpack","umbrella","handbag","tie","suitcase","frisbee","skis","snowboard",
+    "sports ball","kite","baseball bat","baseball glove","skateboard","surfboard",
+    "tennis racket","bottle","wine glass","cup","fork","knife","spoon","bowl",
+    "banana","apple","sandwich","orange","broccoli","carrot","hot dog","pizza",
+    "donut","cake","chair","couch","potted plant","bed","dining table","toilet",
+    "tv","laptop","mouse","remote","keyboard","cell phone","microwave","oven",
+    "toaster","sink","refrigerator","book","clock","vase","scissors","teddy bear",
+    "hair drier","toothbrush"
+};
+static constexpr int NUM_CLASSES = 80;
+
+struct Detection {
+    float x1, y1, x2, y2;
+    float confidence;
+    int   class_id;
+};
+
+struct LetterboxInfo {
+    float scale{1.0f};
+    int pad_x{0};
+    int pad_y{0};
+};
+
+static float iou(const Detection& a, const Detection& b) {
+    float ix1 = std::max(a.x1, b.x1);
+    float iy1 = std::max(a.y1, b.y1);
+    float ix2 = std::min(a.x2, b.x2);
+    float iy2 = std::min(a.y2, b.y2);
+    float iw = std::max(0.0f, ix2 - ix1);
+    float ih = std::max(0.0f, iy2 - iy1);
+    if (iw <= 0.0f || ih <= 0.0f) return 0.0f;
+    float inter = iw * ih;
+    float area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
+    float area_b = (b.x2 - b.x1) * (b.y2 - b.y1);
+    return inter / (area_a + area_b - inter + 1e-6f);
+}
+
+static std::vector<Detection> nms(std::vector<Detection>& dets, float iou_thresh) {
+    std::sort(dets.begin(), dets.end(), [](const Detection& a, const Detection& b) {
+        return a.confidence > b.confidence;
+    });
+    std::vector<bool> suppressed(dets.size(), false);
+    std::vector<Detection> result;
+    for (size_t i = 0; i < dets.size(); ++i) {
+        if (suppressed[i]) continue;
+        result.push_back(dets[i]);
+        for (size_t j = i + 1; j < dets.size(); ++j) {
+            if (!suppressed[j] && iou(dets[i], dets[j]) > iou_thresh)
+                suppressed[j] = true;
+        }
+    }
+    return result;
+}
+
+static float sigmoid_if_needed(float v) {
+    if (v >= 0.0f && v <= 1.0f) return v;
+    if (v >= 16.0f) return 1.0f;
+    if (v <= -16.0f) return 0.0f;
+    return 1.0f / (1.0f + std::exp(-v));
+}
+
+static int tensor_channels(const rknn_tensor_attr& attr, int grid_area) {
+    if (grid_area <= 0 || attr.n_elems % static_cast<uint32_t>(grid_area) != 0) return 0;
+    return static_cast<int>(attr.n_elems / static_cast<uint32_t>(grid_area));
+}
+
+static bool attr_has_dim(const rknn_tensor_attr& attr, uint32_t value) {
+    for (uint32_t i = 0; i < attr.n_dims; ++i) {
+        if (attr.dims[i] == value) return true;
+    }
+    return false;
+}
+
+static int find_output(const std::vector<rknn_tensor_attr>& attrs,
+                       int grid_w, int grid_h, int channels) {
+    int grid_area = grid_w * grid_h;
+    for (size_t i = 0; i < attrs.size(); ++i) {
+        if (tensor_channels(attrs[i], grid_area) != channels) continue;
+        if (!attr_has_dim(attrs[i], static_cast<uint32_t>(grid_w))) continue;
+        if (!attr_has_dim(attrs[i], static_cast<uint32_t>(grid_h))) continue;
+        if (channels > 1 && !attr_has_dim(attrs[i], static_cast<uint32_t>(channels))) continue;
+        return static_cast<int>(i);
+    }
+    return -1;
+}
+
+static float output_at(const float* data, const rknn_tensor_attr& attr,
+                       int channel, int idx, int grid_area, int channels) {
+    if (attr.fmt == RKNN_TENSOR_NHWC) return data[idx * channels + channel];
+    return data[channel * grid_area + idx];
+}
+
+static void print_tensor_attr(const char* tag, const rknn_tensor_attr& attr) {
+    std::printf("%s[%u] name=%s dims=[", tag, attr.index, attr.name);
+    for (uint32_t i = 0; i < attr.n_dims; ++i) {
+        std::printf("%u%s", attr.dims[i], i + 1 < attr.n_dims ? "," : "");
+    }
+    std::printf("] elems=%u size=%u fmt=%d type=%d qnt=%d zp=%d scale=%g\n",
+                attr.n_elems, attr.size, attr.fmt, attr.type, attr.qnt_type,
+                attr.zp, attr.scale);
+}
+
+static std::vector<char> read_file(const char* path) {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.good()) return {};
+    ifs.seekg(0, std::ios::end);
+    size_t size = ifs.tellg();
+    ifs.seekg(0, std::ios::beg);
+    std::vector<char> data(size);
+    ifs.read(data.data(), size);
+    return data;
+}
+
+static void draw_rect_nv12(uint8_t* nv12, int w, int h, int x1, int y1, int x2, int y2, int t, uint8_t Y, uint8_t U, uint8_t V) {
+    x1 = std::max(0, std::min(x1, w - 1));
+    y1 = std::max(0, std::min(y1, h - 1));
+    x2 = std::max(0, std::min(x2, w - 1));
+    y2 = std::max(0, std::min(y2, h - 1));
+    
+    auto draw_point = [&](int x, int y) {
+        if (x < 0 || x >= w || y < 0 || y >= h) return;
+        nv12[y * w + x] = Y;
+        int uv_idx = w * h + (y / 2) * w + (x / 2) * 2;
+        nv12[uv_idx] = U;
+        nv12[uv_idx + 1] = V;
+    };
+    
+    for (int i = 0; i < t; i++) {
+        for (int x = x1; x <= x2; x++) { draw_point(x, y1 + i); draw_point(x, y2 - i); }
+        for (int y = y1; y <= y2; y++) { draw_point(x1 + i, y); draw_point(x2 - i, y); }
+    }
+}
+
+static void downscale_nv12_nearest(const uint8_t* src, int src_w, int src_h,
+                                   uint8_t* dst, int dst_w, int dst_h) {
+    const uint8_t* src_y = src;
+    const uint8_t* src_uv = src + src_w * src_h;
+    uint8_t* dst_y = dst;
+    uint8_t* dst_uv = dst + dst_w * dst_h;
+
+    for (int y = 0; y < dst_h; ++y) {
+        int sy = std::min(src_h - 1, y * src_h / dst_h);
+        for (int x = 0; x < dst_w; ++x) {
+            int sx = std::min(src_w - 1, x * src_w / dst_w);
+            dst_y[y * dst_w + x] = src_y[sy * src_w + sx];
+        }
+    }
+
+    for (int y = 0; y < dst_h / 2; ++y) {
+        int sy = std::min(src_h / 2 - 1, y * src_h / dst_h);
+        for (int x = 0; x < dst_w; x += 2) {
+            int sx = std::min(src_w - 2, (x * src_w / dst_w) & ~1);
+            dst_uv[y * dst_w + x] = src_uv[sy * src_w + sx];
+            dst_uv[y * dst_w + x + 1] = src_uv[sy * src_w + sx + 1];
+        }
+    }
+}
+
+static void downscale_nv12_nearest_rot180(const uint8_t* src, int src_w, int src_h,
+                                          uint8_t* dst, int dst_w, int dst_h) {
+    const uint8_t* src_y = src;
+    const uint8_t* src_uv = src + src_w * src_h;
+    uint8_t* dst_y = dst;
+    uint8_t* dst_uv = dst + dst_w * dst_h;
+
+    for (int y = 0; y < dst_h; ++y) {
+        int sy = src_h - 1 - std::min(src_h - 1, y * src_h / dst_h);
+        for (int x = 0; x < dst_w; ++x) {
+            int sx = src_w - 1 - std::min(src_w - 1, x * src_w / dst_w);
+            dst_y[y * dst_w + x] = src_y[sy * src_w + sx];
+        }
+    }
+
+    for (int y = 0; y < dst_h / 2; ++y) {
+        int sy = src_h / 2 - 1 - std::min(src_h / 2 - 1, y * src_h / dst_h);
+        for (int x = 0; x < dst_w; x += 2) {
+            int sx = src_w - 2 - (std::min(src_w - 2, x * src_w / dst_w) & ~1);
+            sx &= ~1;
+            dst_uv[y * dst_w + x] = src_uv[sy * src_w + sx];
+            dst_uv[y * dst_w + x + 1] = src_uv[sy * src_w + sx + 1];
+        }
+    }
+}
+
+class MjpegEncoder {
+public:
+    bool init(int width, int height, int fps, int quality) {
+        width_ = width;
+        height_ = height;
+        hor_stride_ = align16(static_cast<uint32_t>(width));
+        ver_stride_ = align16(static_cast<uint32_t>(height));
+        frame_size_ = hor_stride_ * ver_stride_ * 3 / 2;
+
+        if (mpp_create(&ctx_, &mpi_) != MPP_OK || !ctx_ || !mpi_) {
+            std::fprintf(stderr, "[错误] mpp_create 失败\n");
+            return false;
+        }
+        if (mpp_init(ctx_, MPP_CTX_ENC, MPP_VIDEO_CodingMJPEG) != MPP_OK) {
+            std::fprintf(stderr, "[错误] mpp_init MJPEG 失败\n");
+            return false;
+        }
+        if (mpp_enc_cfg_init(&cfg_) != MPP_OK) {
+            std::fprintf(stderr, "[错误] mpp_enc_cfg_init 失败\n");
+            return false;
+        }
+
+        MppEncPrepCfg prep{};
+        prep.width_set = width_;
+        prep.height_set = height_;
+        prep.width = width_;
+        prep.height = height_;
+        prep.hor_stride = static_cast<RK_S32>(hor_stride_);
+        prep.ver_stride = static_cast<RK_S32>(ver_stride_);
+        prep.max_width = width_;
+        prep.max_height = height_;
+        prep.format = MPP_FMT_YUV420SP;
+        prep.range = MPP_FRAME_RANGE_JPEG;
+        prep.range_out = MPP_FRAME_RANGE_JPEG;
+        prep.color = MPP_FRAME_SPC_BT709;
+        prep.colorprim = MPP_FRAME_PRI_BT709;
+        prep.colortrc = MPP_FRAME_TRC_BT709;
+        prep.rotation = MPP_ENC_ROT_0;
+        prep.mirroring = 0;
+        prep.flip = 0;
+
+        MppEncRcCfg rc{};
+        rc.rc_mode = MPP_ENC_RC_MODE_FIXQP;
+        rc.quality = MPP_ENC_RC_QUALITY_BEST;
+        rc.bps_target = std::max(1024 * 1024, width_ * height_ * 2);
+        rc.bps_max = rc.bps_target;
+        rc.bps_min = rc.bps_target;
+        rc.fps_in_flex = 0;
+        rc.fps_in_num = fps;
+        rc.fps_in_denom = 1;
+        rc.fps_out_flex = 0;
+        rc.fps_out_num = fps;
+        rc.fps_out_denom = 1;
+        rc.gop = fps;
+        rc.gop_mode = MPP_ENC_RC_NORMAL_P;
+        rc.drop_mode = MPP_ENC_RC_DROP_FRM_DISABLED;
+        rc.max_reenc_times = 0;
+
+        MppEncJpegCfg jpeg_cfg{};
+        jpeg_cfg.q_mode = JPEG_QFACTOR;
+        jpeg_cfg.update = 1;
+        jpeg_cfg.q_factor = quality;
+        mpp_enc_cfg_set_s32(cfg_, "prep:width", width_);
+        mpp_enc_cfg_set_s32(cfg_, "prep:height", height_);
+        mpp_enc_cfg_set_s32(cfg_, "prep:hor_stride", hor_stride_);
+        mpp_enc_cfg_set_s32(cfg_, "prep:ver_stride", ver_stride_);
+        mpp_enc_cfg_set_s32(cfg_, "prep:format", MPP_FMT_YUV420SP);
+
+        mpp_enc_cfg_set_s32(cfg_, "rc:mode", MPP_ENC_RC_MODE_FIXQP);
+        mpp_enc_cfg_set_s32(cfg_, "rc:bps_target", rc.bps_target);
+        mpp_enc_cfg_set_s32(cfg_, "rc:bps_max", rc.bps_max);
+        mpp_enc_cfg_set_s32(cfg_, "rc:bps_min", rc.bps_min);
+        mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_flex", 0);
+        mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_num", fps);
+        mpp_enc_cfg_set_s32(cfg_, "rc:fps_in_denorm", 1);
+        mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_flex", 0);
+        mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_num", fps);
+        mpp_enc_cfg_set_s32(cfg_, "rc:fps_out_denorm", 1);
+        mpp_enc_cfg_set_s32(cfg_, "rc:gop", fps);
+
+        mpp_enc_cfg_set_s32(cfg_, "jpeg:q_factor", quality);
+        mpp_enc_cfg_set_s32(cfg_, "jpeg:qf_max", 99);
+        mpp_enc_cfg_set_s32(cfg_, "jpeg:qf_min", 1);
+
+        if (mpi_->control(ctx_, MPP_ENC_SET_CFG, cfg_) != MPP_OK) {
+            std::fprintf(stderr, "[错误] MPP_ENC_SET_CFG 失败\n");
+            return false;
+        }
+
+        if (mpp_buffer_group_get_internal(&frame_group_, MPP_BUFFER_TYPE_DMA_HEAP) != MPP_OK) {
+            if (mpp_buffer_group_get_internal(&frame_group_, MPP_BUFFER_TYPE_DRM) != MPP_OK &&
+                mpp_buffer_group_get_internal(&frame_group_, MPP_BUFFER_TYPE_ION) != MPP_OK) {
+                std::fprintf(stderr, "[错误] MPP buffer group 创建失败\n");
+                return false;
+            }
+        }
+        if (mpp_buffer_get(frame_group_, &frame_buffer_, frame_size_) != MPP_OK) {
+            std::fprintf(stderr, "[错误] MPP frame buffer 分配失败\n");
+            return false;
+        }
+        frame_ptr_ = static_cast<uint8_t*>(mpp_buffer_get_ptr(frame_buffer_));
+        if (!frame_ptr_) {
+            std::fprintf(stderr, "[错误] MPP frame buffer 映射失败\n");
+            return false;
+        }
+        return true;
+    }
+
+    bool encode_nv12(const uint8_t* nv12, int stride, std::vector<uint8_t>& jpeg, int64_t pts_us) {
+        if (!ctx_ || !frame_ptr_) return false;
+
+        mpp_buffer_sync_begin(frame_buffer_);
+        if (static_cast<uint32_t>(stride) == hor_stride_) {
+            std::memcpy(frame_ptr_, nv12, frame_size_);
+        } else {
+            for (int y = 0; y < height_; ++y) {
+                std::memcpy(frame_ptr_ + y * hor_stride_,
+                            nv12 + y * stride,
+                            static_cast<size_t>(width_));
+            }
+            uint8_t* dst_uv = frame_ptr_ + hor_stride_ * ver_stride_;
+            const uint8_t* src_uv = nv12 + stride * height_;
+            for (int y = 0; y < height_ / 2; ++y) {
+                std::memcpy(dst_uv + y * hor_stride_,
+                            src_uv + y * stride,
+                            static_cast<size_t>(width_));
+            }
+        }
+        mpp_buffer_sync_end(frame_buffer_);
+
+        MppFrame frame = nullptr;
+        if (mpp_frame_init(&frame) != MPP_OK) return false;
+        mpp_frame_set_width(frame, width_);
+        mpp_frame_set_height(frame, height_);
+        mpp_frame_set_hor_stride(frame, hor_stride_);
+        mpp_frame_set_ver_stride(frame, ver_stride_);
+        mpp_frame_set_fmt(frame, MPP_FMT_YUV420SP);
+        mpp_frame_set_color_range(frame, MPP_FRAME_RANGE_JPEG);
+        mpp_frame_set_buf_size(frame, frame_size_);
+        mpp_frame_set_pts(frame, pts_us);
+        mpp_frame_set_buffer(frame, frame_buffer_);
+
+        MppPacket packet = nullptr;
+        MPP_RET ret = mpi_->encode(ctx_, frame, &packet);
+        mpp_frame_deinit(&frame);
+        if (ret != MPP_OK || !packet) return false;
+
+        void* pos = mpp_packet_get_pos(packet);
+        size_t len = mpp_packet_get_length(packet);
+        if (!pos || len == 0) {
+            mpp_packet_deinit(&packet);
+            return false;
+        }
+        jpeg.assign(static_cast<uint8_t*>(pos), static_cast<uint8_t*>(pos) + len);
+        mpp_packet_deinit(&packet);
+        return true;
+    }
+
+    void deinit() {
+        if (frame_buffer_) {
+            mpp_buffer_put(frame_buffer_);
+            frame_buffer_ = nullptr;
+        }
+        if (frame_group_) {
+            mpp_buffer_group_put(frame_group_);
+            frame_group_ = nullptr;
+        }
+        if (cfg_) {
+            mpp_enc_cfg_deinit(cfg_);
+            cfg_ = nullptr;
+        }
+        if (ctx_) {
+            mpp_destroy(ctx_);
+            ctx_ = nullptr;
+            mpi_ = nullptr;
+        }
+    }
+
+    ~MjpegEncoder() { deinit(); }
+
+private:
+    MppCtx ctx_{nullptr};
+    MppApi* mpi_{nullptr};
+    MppEncCfg cfg_{nullptr};
+    MppBufferGroup frame_group_{nullptr};
+    MppBuffer frame_buffer_{nullptr};
+    uint8_t* frame_ptr_{nullptr};
+    int width_{0};
+    int height_{0};
+    uint32_t hor_stride_{0};
+    uint32_t ver_stride_{0};
+    size_t frame_size_{0};
+};
+
+#pragma pack(push, 1)
+struct UdpMjpegHeader {
+    char magic[4];
+    uint16_t version;
+    uint16_t header_size;
+    uint32_t frame_id;
+    uint32_t total_size;
+    uint32_t offset;
+    uint16_t chunk_size;
+    uint16_t chunk_index;
+    uint16_t chunk_count;
+    uint16_t width;
+    uint16_t height;
+    uint16_t flags;
+};
+#pragma pack(pop)
+
+class UdpMjpegSender {
+public:
+    bool init(const std::string& target_ip, int port, const std::string& source_ip) {
+        fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd_ < 0) {
+            std::perror("socket udp");
+            return false;
+        }
+        int sndbuf = 4 * 1024 * 1024;
+        setsockopt(fd_, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+        int broadcast = 1;
+        setsockopt(fd_, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+
+        if (!source_ip.empty() && source_ip != "0.0.0.0" && has_local_ip(source_ip)) {
+            struct sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_port = htons(0);
+            inet_pton(AF_INET, source_ip.c_str(), &local.sin_addr);
+            if (bind(fd_, reinterpret_cast<struct sockaddr*>(&local), sizeof(local)) != 0) {
+                std::perror("bind udp source");
+            }
+        }
+
+        target_.sin_family = AF_INET;
+        target_.sin_port = htons(static_cast<uint16_t>(port));
+        if (inet_pton(AF_INET, target_ip.c_str(), &target_.sin_addr) != 1) {
+            std::fprintf(stderr, "[错误] 无效 UDP 目标 IP: %s\n", target_ip.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    bool send_frame(const std::vector<uint8_t>& jpeg, int width, int height) {
+        if (fd_ < 0 || jpeg.empty()) return false;
+        constexpr size_t MAX_DATAGRAM = 1400;
+        constexpr size_t HEADER_SIZE = sizeof(UdpMjpegHeader);
+        constexpr size_t PAYLOAD_SIZE = MAX_DATAGRAM - HEADER_SIZE;
+        const uint16_t chunk_count = static_cast<uint16_t>((jpeg.size() + PAYLOAD_SIZE - 1) / PAYLOAD_SIZE);
+        const uint32_t frame_id = frame_id_++;
+
+        uint8_t packet[MAX_DATAGRAM];
+        for (uint16_t idx = 0; idx < chunk_count; ++idx) {
+            const size_t offset = static_cast<size_t>(idx) * PAYLOAD_SIZE;
+            const size_t chunk = std::min(PAYLOAD_SIZE, jpeg.size() - offset);
+            UdpMjpegHeader hdr{};
+            hdr.magic[0] = 'M'; hdr.magic[1] = 'J'; hdr.magic[2] = 'P'; hdr.magic[3] = 'G';
+            hdr.version = 2;
+            hdr.header_size = HEADER_SIZE;
+            hdr.frame_id = frame_id;
+            hdr.total_size = static_cast<uint32_t>(jpeg.size());
+            hdr.offset = static_cast<uint32_t>(offset);
+            hdr.chunk_size = static_cast<uint16_t>(chunk);
+            hdr.chunk_index = idx;
+            hdr.chunk_count = chunk_count;
+            hdr.width = static_cast<uint16_t>(width);
+            hdr.height = static_cast<uint16_t>(height);
+            std::memcpy(packet, &hdr, HEADER_SIZE);
+            std::memcpy(packet + HEADER_SIZE, jpeg.data() + offset, chunk);
+            ssize_t sent = sendto(fd_, packet, HEADER_SIZE + chunk, 0,
+                                  reinterpret_cast<struct sockaddr*>(&target_), sizeof(target_));
+            if (sent != static_cast<ssize_t>(HEADER_SIZE + chunk)) return false;
+        }
+        return true;
+    }
+
+    void close_socket() {
+        if (fd_ >= 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    ~UdpMjpegSender() { close_socket(); }
+
+private:
+    int fd_{-1};
+    uint32_t frame_id_{1};
+    struct sockaddr_in target_{};
+};
+
+static void draw_rect_nv12_rot180(uint8_t* nv12, int w, int h, int x1, int y1, int x2, int y2,
+                                  int t, uint8_t Y, uint8_t U, uint8_t V) {
+    auto map_x = [&](int x) { return w - 1 - x; };
+    auto map_y = [&](int y) { return h - 1 - y; };
+    x1 = std::max(0, std::min(x1, w - 1));
+    y1 = std::max(0, std::min(y1, h - 1));
+    x2 = std::max(0, std::min(x2, w - 1));
+    y2 = std::max(0, std::min(y2, h - 1));
+    auto draw_point = [&](int x, int y) {
+        x = map_x(x);
+        y = map_y(y);
+        if (x < 0 || x >= w || y < 0 || y >= h) return;
+        nv12[y * w + x] = Y;
+        int uv_idx = w * h + (y / 2) * w + (x / 2) * 2;
+        nv12[uv_idx] = U;
+        nv12[uv_idx + 1] = V;
+    };
+    for (int i = 0; i < t; i++) {
+        for (int x = x1; x <= x2; x++) { draw_point(x, y1 + i); draw_point(x, y2 - i); }
+        for (int y = y1; y <= y2; y++) { draw_point(x1 + i, y); draw_point(x2 - i, y); }
+    }
+}
+
+int main() {
+    std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    auto& log = rv1126b::Logger::get();
+    log.set_level(rv1126b::LogLevel::Info);
+
+    constexpr const char* MODEL_PATH = "/oem/usr/share/model/rknn/yolox_s.rknn";
+    constexpr int   INPUT_W    = 640;
+    constexpr int   INPUT_H    = 640;
+    constexpr float CONF_THRESH = 0.50f;
+    constexpr float IOU_THRESH  = 0.45f;
+    
+    constexpr int CAM_W = 2560;
+    constexpr int CAM_H = 1440;
+    const int CAM_FPS = env_int("RECAMERA_CAM_FPS", 30, 1, 60);
+    const int PREVIEW_W = env_int("RECAMERA_PREVIEW_W", 1920, 320, 3840);
+    const int PREVIEW_H = env_int("RECAMERA_PREVIEW_H", 1080, 240, 2160);
+    const int PREVIEW_FPS = env_int("RECAMERA_PREVIEW_FPS", 30, 1, 60);
+    const int JPEG_QUALITY = env_int("RECAMERA_JPEG_QUALITY", 85, 1, 99);
+    constexpr int PREVIEW_PORT = 9090;
+    constexpr const char* AIQ_IQ_DIR = "/etc/iqfiles";
+    const std::string TARGET_IP = env_string("RECAMERA_UDP_TARGET", "192.168.2.255");
+    const std::string SOURCE_IP = pick_source_ip();
+
+    std::printf("=== RKNN YOLOX-S MJPEG UDP 目标检测预览 ===\n");
+    std::printf("模型: %s\n", MODEL_PATH);
+
+    auto model_data = read_file(MODEL_PATH);
+    if (model_data.empty()) {
+        std::fprintf(stderr, "[错误] 读取模型失败\n");
+        return EXIT_FAILURE;
+    }
+    rknn_context ctx;
+    if (rknn_init(&ctx, model_data.data(), model_data.size(), 0, NULL) != RKNN_SUCC) {
+        std::fprintf(stderr, "[错误] rknn_init 失败\n");
+        return EXIT_FAILURE;
+    }
+    rknn_input_output_num io_num;
+    rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num));
+    std::printf("RKNN IO: inputs=%u outputs=%u, threshold=%.2f\n",
+                io_num.n_input, io_num.n_output, CONF_THRESH);
+    if (io_num.n_output != 9) {
+        std::fprintf(stderr, "[错误] YOLOX-S 后处理期望 9 个输出，实际 %u 个\n", io_num.n_output);
+        rknn_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+
+    std::vector<rknn_tensor_attr> output_attrs(io_num.n_output);
+    for (uint32_t i = 0; i < io_num.n_output; ++i) {
+        memset(&output_attrs[i], 0, sizeof(output_attrs[i]));
+        output_attrs[i].index = i;
+        rknn_query(ctx, RKNN_QUERY_OUTPUT_ATTR, &output_attrs[i], sizeof(rknn_tensor_attr));
+        print_tensor_attr("output", output_attrs[i]);
+    }
+
+    rv1126b::Camera::Config cam_cfg;
+    cam_cfg.width = CAM_W;
+    cam_cfg.height = CAM_H;
+    cam_cfg.fps = CAM_FPS;
+    rv1126b::Camera camera;
+    if (!camera.open(cam_cfg).ok()) {
+        std::fprintf(stderr, "[错误] 摄像头打开失败\n");
+        return EXIT_FAILURE;
+    }
+
+    rv1126b::ISP isp;
+    auto isp_res = isp.init(AIQ_IQ_DIR);
+    if (!isp_res.ok()) {
+        std::fprintf(stderr, "[错误] ISP/AIQ 启动失败，无法保证曝光和白平衡\n");
+        g_stop.store(true, std::memory_order_relaxed);
+        camera.close();
+        rknn_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+
+    std::vector<uint8_t> input_buf(INPUT_W * INPUT_H * 3);
+    uint64_t frame_count = 0;
+    uint64_t preview_frames = 0;
+    uint64_t infer_count = 0;
+    uint64_t infer_ms_total = 0;
+    auto last_preview_push = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    std::mutex latest_mutex;
+    std::vector<uint8_t> latest_raw(CAM_W * CAM_H * 3 / 2);
+    std::vector<uint8_t> infer_frame(CAM_W * CAM_H * 3 / 2);
+    uint64_t latest_seq = 0;
+    bool latest_valid = false;
+    std::mutex det_mutex;
+    std::vector<Detection> last_dets;
+
+    auto preprocess_nv12_to_rgb = [&](const uint8_t* src, int src_w, int src_h, uint8_t* dst, int dst_w, int dst_h) {
+        const uint8_t* Y  = src;
+        const uint8_t* UV = src + src_w * src_h;
+        std::fill(dst, dst + dst_w * dst_h * 3, static_cast<uint8_t>(114));
+
+        LetterboxInfo lb;
+        lb.scale = std::min(static_cast<float>(dst_w) / src_w,
+                            static_cast<float>(dst_h) / src_h);
+        int resized_w = std::max(1, static_cast<int>(src_w * lb.scale));
+        int resized_h = std::max(1, static_cast<int>(src_h * lb.scale));
+        lb.pad_x = (dst_w - resized_w) / 2;
+        lb.pad_y = (dst_h - resized_h) / 2;
+
+        for (int ry = 0; ry < resized_h; ++ry) {
+            int sy_i = src_h - 1 - std::min(static_cast<int>(ry / lb.scale), src_h - 1);
+            int dy = ry + lb.pad_y;
+            for (int rx = 0; rx < resized_w; ++rx) {
+                int sx_i = src_w - 1 - std::min(static_cast<int>(rx / lb.scale), src_w - 1);
+                int dx = rx + lb.pad_x;
+                uint8_t y_val  = Y[sy_i * src_w + sx_i];
+                int     uv_row = (sy_i / 2) * src_w + (sx_i & ~1);
+                uint8_t u_val  = UV[uv_row], v_val = UV[uv_row + 1];
+                int c = y_val - 16, d = u_val - 128, e = v_val - 128;
+                int r = (298 * c + 409 * e + 128) >> 8;
+                int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+                int b = (298 * c + 516 * d + 128) >> 8;
+                uint8_t* pix = dst + (dy * dst_w + dx) * 3;
+                pix[0] = std::max(0, std::min(255, r));
+                pix[1] = std::max(0, std::min(255, g));
+                pix[2] = std::max(0, std::min(255, b));
+            }
+        }
+
+        return lb;
+    };
+
+    std::vector<uint8_t> preview_nv12(PREVIEW_W * PREVIEW_H * 3 / 2);
+    std::vector<uint8_t> preview_jpeg;
+
+    camera.set_frame_callback([&](const rv1126b::VideoFrame& frame) {
+        if (g_stop.load()) return;
+        frame_count++;
+
+        if (frame.data && frame.size >= (size_t)(CAM_W * CAM_H * 3 / 2)) {
+            {
+                std::lock_guard<std::mutex> lock(latest_mutex);
+                std::memcpy(latest_raw.data(), frame.data, CAM_W * CAM_H * 3 / 2);
+                latest_seq++;
+                latest_valid = true;
+            }
+
+            if (frame_count % 6 == 1) {
+                {
+                    std::lock_guard<std::mutex> lock(latest_mutex);
+                    std::memcpy(infer_frame.data(), latest_raw.data(), infer_frame.size());
+                }
+                LetterboxInfo lb = preprocess_nv12_to_rgb(infer_frame.data(), CAM_W, CAM_H,
+                                                          input_buf.data(), INPUT_W, INPUT_H);
+
+                rknn_input inputs[1];
+                memset(inputs, 0, sizeof(inputs));
+                inputs[0].index = 0;
+                inputs[0].type = RKNN_TENSOR_UINT8;
+                inputs[0].size = input_buf.size();
+                inputs[0].fmt = RKNN_TENSOR_NHWC;
+                inputs[0].buf = input_buf.data();
+
+                auto infer_t0 = std::chrono::steady_clock::now();
+                if (rknn_inputs_set(ctx, 1, inputs) == RKNN_SUCC && rknn_run(ctx, NULL) == RKNN_SUCC) {
+                    rknn_output outputs[9];
+                    memset(outputs, 0, sizeof(outputs));
+                    for (int i = 0; i < 9; i++) {
+                        outputs[i].index = i;
+                        outputs[i].want_float = 1;
+                    }
+
+                    if (rknn_outputs_get(ctx, 9, outputs, NULL) == RKNN_SUCC) {
+                        std::vector<Detection> dets;
+                        int strides[3] = {8, 16, 32};
+
+                        for (int s_idx = 0; s_idx < 3; s_idx++) {
+                            int stride = strides[s_idx];
+                            int grid_w = INPUT_W / stride;
+                            int grid_h = INPUT_H / stride;
+                            int grid_area = grid_w * grid_h;
+
+                            int reg_idx = find_output(output_attrs, grid_w, grid_h, 4);
+                            int obj_idx = find_output(output_attrs, grid_w, grid_h, 1);
+                            int cls_idx = find_output(output_attrs, grid_w, grid_h, NUM_CLASSES);
+                            if (reg_idx < 0 || obj_idx < 0 || cls_idx < 0) continue;
+
+                            const float* reg = static_cast<const float*>(outputs[reg_idx].buf);
+                            const float* obj = static_cast<const float*>(outputs[obj_idx].buf);
+                            const float* cls = static_cast<const float*>(outputs[cls_idx].buf);
+
+                            for (int y = 0; y < grid_h; y++) {
+                                for (int x = 0; x < grid_w; x++) {
+                                    int idx = y * grid_w + x;
+                                    float obj_conf = sigmoid_if_needed(
+                                        output_at(obj, output_attrs[obj_idx], 0, idx, grid_area, 1));
+                                    if (obj_conf < CONF_THRESH) continue;
+
+                                    int best_cls = 0;
+                                    float best_prob = sigmoid_if_needed(
+                                        output_at(cls, output_attrs[cls_idx], 0, idx, grid_area, NUM_CLASSES));
+                                    for (int c = 1; c < NUM_CLASSES; c++) {
+                                        float prob = sigmoid_if_needed(
+                                            output_at(cls, output_attrs[cls_idx], c, idx, grid_area, NUM_CLASSES));
+                                        if (prob > best_prob) { best_prob = prob; best_cls = c; }
+                                    }
+
+                                    float score = obj_conf * best_prob;
+                                    if (score < CONF_THRESH) continue;
+
+                                    float dx = output_at(reg, output_attrs[reg_idx], 0, idx, grid_area, 4);
+                                    float dy = output_at(reg, output_attrs[reg_idx], 1, idx, grid_area, 4);
+                                    float dw = output_at(reg, output_attrs[reg_idx], 2, idx, grid_area, 4);
+                                    float dh = output_at(reg, output_attrs[reg_idx], 3, idx, grid_area, 4);
+                                    float cx = (x + dx) * stride;
+                                    float cy = (y + dy) * stride;
+                                    float bw = std::exp(std::max(-8.0f, std::min(8.0f, dw))) * stride;
+                                    float bh = std::exp(std::max(-8.0f, std::min(8.0f, dh))) * stride;
+
+                                    Detection d;
+                                    d.x1 = (cx - bw * 0.5f - lb.pad_x) / lb.scale;
+                                    d.y1 = (cy - bh * 0.5f - lb.pad_y) / lb.scale;
+                                    d.x2 = (cx + bw * 0.5f - lb.pad_x) / lb.scale;
+                                    d.y2 = (cy + bh * 0.5f - lb.pad_y) / lb.scale;
+                                    d.x1 = std::max(0.0f, std::min(static_cast<float>(CAM_W - 1), d.x1));
+                                    d.y1 = std::max(0.0f, std::min(static_cast<float>(CAM_H - 1), d.y1));
+                                    d.x2 = std::max(0.0f, std::min(static_cast<float>(CAM_W - 1), d.x2));
+                                    d.y2 = std::max(0.0f, std::min(static_cast<float>(CAM_H - 1), d.y2));
+                                    if (d.x2 <= d.x1 || d.y2 <= d.y1) continue;
+                                    d.confidence = score;
+                                    d.class_id = best_cls;
+                                    dets.push_back(d);
+                                }
+                            }
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(det_mutex);
+                            last_dets = nms(dets, IOU_THRESH);
+                        }
+                        rknn_outputs_release(ctx, 9, outputs);
+                    }
+                }
+                auto infer_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - infer_t0).count();
+                infer_count++;
+                infer_ms_total += static_cast<uint64_t>(infer_ms);
+            }
+        }
+    });
+
+    MjpegEncoder encoder;
+    if (!encoder.init(PREVIEW_W, PREVIEW_H, PREVIEW_FPS, JPEG_QUALITY)) {
+        std::fprintf(stderr, "[错误] MJPEG 编码器初始化失败\n");
+        isp.deinit();
+        camera.close();
+        rknn_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+    UdpMjpegSender sender;
+    if (!sender.init(TARGET_IP, PREVIEW_PORT, SOURCE_IP)) {
+        std::fprintf(stderr, "[错误] UDP 发送器初始化失败\n");
+        encoder.deinit();
+        isp.deinit();
+        camera.close();
+        rknn_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+
+    std::thread preview_thread([&]() {
+        auto next_tick = std::chrono::steady_clock::now();
+        std::vector<uint8_t> frame_copy(CAM_W * CAM_H * 3 / 2);
+        while (!g_stop.load(std::memory_order_relaxed)) {
+            next_tick += std::chrono::milliseconds(1000 / PREVIEW_FPS);
+            std::vector<Detection> dets_copy;
+            bool have_frame = false;
+            {
+                std::lock_guard<std::mutex> lock(latest_mutex);
+                have_frame = latest_valid;
+                if (have_frame) {
+                    std::memcpy(frame_copy.data(), latest_raw.data(), frame_copy.size());
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(det_mutex);
+                dets_copy = last_dets;
+            }
+            if (have_frame) {
+                downscale_nv12_nearest_rot180(frame_copy.data(), CAM_W, CAM_H, preview_nv12.data(), PREVIEW_W, PREVIEW_H);
+                for (const auto& d : dets_copy) {
+                    float sx = static_cast<float>(PREVIEW_W) / CAM_W;
+                    float sy = static_cast<float>(PREVIEW_H) / CAM_H;
+                    int x1 = static_cast<int>(d.x1 * sx);
+                    int y1 = static_cast<int>(d.y1 * sy);
+                    int x2 = static_cast<int>(d.x2 * sx);
+                    int y2 = static_cast<int>(d.y2 * sy);
+                    draw_rect_nv12_rot180(preview_nv12.data(), PREVIEW_W, PREVIEW_H, x1, y1, x2, y2, 4, 76, 85, 255);
+                }
+                preview_jpeg.clear();
+                auto pts_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (encoder.encode_nv12(preview_nv12.data(), PREVIEW_W, preview_jpeg, pts_us)) {
+                    if (sender.send_frame(preview_jpeg, PREVIEW_W, PREVIEW_H)) {
+                        preview_frames++;
+                    }
+                }
+            }
+            std::this_thread::sleep_until(next_tick);
+        }
+    });
+
+    if (!camera.start().ok()) {
+        std::fprintf(stderr, "[错误] 摄像头启动失败\n");
+        g_stop.store(true, std::memory_order_relaxed);
+        if (preview_thread.joinable()) preview_thread.join();
+        sender.close_socket();
+        encoder.deinit();
+        isp.deinit();
+        camera.close();
+        rknn_destroy(ctx);
+        return EXIT_FAILURE;
+    }
+
+    std::printf("UDP MJPEG 预览流已启动: udp://%s:%d  (%dx%d MJPEG @ %dfps, camera %dx%d @ %dfps)\n",
+                TARGET_IP.c_str(), PREVIEW_PORT, PREVIEW_W, PREVIEW_H, PREVIEW_FPS,
+                CAM_W, CAM_H, CAM_FPS);
+
+    auto last_report = std::chrono::steady_clock::now();
+    while (!g_stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds(2)) {
+            last_report = now;
+            double avg_infer_ms = infer_count ? static_cast<double>(infer_ms_total) / infer_count : 0.0;
+            std::printf("[状态] camera %dx%d 已处理 %llu 帧, 推理 %llu 次(avg %.1f ms), 预览 %dx%d %llu 帧, 上一次检测到 %zu 个目标\n",
+                        CAM_W, CAM_H,
+                        (unsigned long long)frame_count,
+                        (unsigned long long)infer_count,
+                        avg_infer_ms,
+                        PREVIEW_W, PREVIEW_H,
+                        (unsigned long long)preview_frames,
+                        last_dets.size());
+            std::fflush(stdout);
+        }
+    }
+
+    camera.stop();
+    isp.deinit();
+    if (preview_thread.joinable()) {
+        preview_thread.join();
+    }
+    encoder.deinit();
+    sender.close_socket();
+    rknn_destroy(ctx);
+    
+    std::printf("\n程序退出。\n");
+    return EXIT_SUCCESS;
+}

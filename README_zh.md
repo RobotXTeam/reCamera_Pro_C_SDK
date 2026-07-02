@@ -57,7 +57,7 @@ export RV1126B_TOOLCHAIN_DIR=$(pwd)/toolchain/linux-ipc-tools-toolchain-aarch64-
 
 ```bash
 # 部署 SDK 动态链接库（仅首次需要）
-scp build-aarch64/src/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
+scp lib/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
 ssh root@192.168.x.xx "ln -sf /tmp/libreCamera_pro_sdk.so.1.0.0 /tmp/libreCamera_pro_sdk.so.1"
 
 # 部署并运行演示程序
@@ -205,7 +205,8 @@ reCamera_Pro_C++_SDK/
 │   └── build.sh                一键式交叉编译脚本
 ├── tools/
 │   ├── deploy.sh               通过 SCP 将二进制文件部署到设备的工具
-│   └── device_info.sh          查询设备硬件信息的脚本
+│   ├── device_info.sh          查询设备硬件信息的脚本
+│   └── demo_env.sh             (需放入设备) 一键关闭/恢复 rkipc 摄像头的环境脚本
 └── tests/                      单元测试 / 集成测试 (占位符)
 ```
 
@@ -216,7 +217,7 @@ reCamera_Pro_C++_SDK/
 ### 部署 SDK 动态链接库（每台设备仅需执行一次）
 
 ```bash
-scp build-aarch64/src/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
+scp lib/libreCamera_pro_sdk.so.1.0.0 root@192.168.x.xx:/tmp/
 ssh root@192.168.x.xx "ln -sf /tmp/libreCamera_pro_sdk.so.1.0.0 /tmp/libreCamera_pro_sdk.so.1"
 ```
 
@@ -247,16 +248,22 @@ LD_LIBRARY_PATH=/tmp:/oem/usr/lib:/usr/lib /tmp/hello_world
 - 位于 `/tmp` 的 SDK 库 (`libreCamera_pro_sdk.so.1`)
 - 位于 `/oem/usr/lib` 的 Rockchip 平台库（如 `librknnrt.so`、`librkaiq.so`、`librga.so`、`librockchip_mpp.so`）
 
-### 管理 rkipc 进程
+### 管理 rkipc 进程与无感运行
 
-在运行多数摄像头演示程序之前，必须先停止系统的摄像头进程（`rkipc`），因为它占用了 `/dev/video13` 设备节点：
+在运行多数摄像头演示程序之前，必须先停止系统的摄像头进程（`rkipc`），因为它占用了 `/dev/video13` 设备节点。
+
+我们在 `tools/` 目录下提供了一个能在电脑端（宿主机）执行的交互式辅助脚本 `demo_env.sh`。这个脚本会一步到位帮你完成“**停止服务**”、“**创建 `/lib_c++` 全局库目录**”、“**修改系统级配置文件**”以及“**自动上传部署 SDK**”：
 
 ```bash
-# 在运行摄像头演示程序前停止进程
-/oem/usr/bin/RkLunch-stop.sh
+# 在您的电脑（宿主机）上运行：
+./tools/demo_env.sh 0
+# 根据提示输入 IP (默认 192.168.4.200)、密码等。
+# 注：首次运行会上传库并部署环境；后续再次运行 0，脚本会智能跳过部署，仅秒关摄像头服务！
+# 执行完毕后，你可以 SSH 进设备，在任何目录下直接执行 `./hello_world` 而无需 export！
 
-# 测试完成后重启进程
-/oem/usr/bin/RkLunch.sh
+# 演示结束，恢复设备出厂监控服务（在您的电脑上运行）：
+./tools/demo_env.sh 1
+# 此时 rkipc 出厂服务恢复正常推流，但 /lib_c++ 环境会被保留供下次直接使用。
 ```
 
 `isp_control` 演示程序是个例外——它需要 `rkipc` 处于**运行状态**，以便能够访问 rkaiq 上下文。

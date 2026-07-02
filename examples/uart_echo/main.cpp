@@ -38,7 +38,7 @@ int main()
     //    备用路径：/dev/ttyS4
     // ---------------------------------------------------------------
     // 请根据您的具体硬件连线，修改对应的 UART 节点
-    constexpr const char* UART_DEV = "/dev/ttyS0"; // TODO: 填写串口设备节点
+    constexpr const char* UART_DEV = "/dev/ttyS2"; // TODO: 填写串口设备节点
 
     std::printf("=== UART 回显示例 ===\n");
     std::printf("设备: %s  波特率: 115200\n\n", UART_DEV);
@@ -74,6 +74,10 @@ int main()
         // 带超时的读操作（100ms 内无数据则返回 0 字节）
         auto read_res = uart.read(rx_buf.data(), rx_buf.size());
         if (!read_res.ok()) {
+            if (read_res.error() == rv1126b::Error::Timeout) {
+                // 超时，继续等待
+                continue;
+            }
             std::fprintf(stderr, "[错误] UART 读取失败: %s\n",
                          std::string(rv1126b::to_string(read_res.error())).c_str());
             break;
@@ -81,7 +85,7 @@ int main()
 
         size_t n = *read_res;
         if (n == 0) {
-            // 超时，继续等待
+            // 没有读到数据，继续等待
             continue;
         }
 

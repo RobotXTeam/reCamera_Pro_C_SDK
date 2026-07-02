@@ -16,7 +16,23 @@ function(add_example name)
 
     target_link_libraries(${name}
         PRIVATE
-            reCamera_Pro_SDK::reCamera_Pro_SDK
+            reCamera_pro_sdk
+            rknnrt
+    )
+    if(TARGET MPP::MPP)
+        target_link_libraries(${name} PRIVATE MPP::MPP)
+    endif()
+    if(TARGET RGA::RGA)
+        target_link_libraries(${name} PRIVATE RGA::RGA)
+    endif()
+    
+    target_include_directories(${name}
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/sysroot/oem/usr/include
+    )
+    target_link_directories(${name}
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/sysroot/oem/usr/lib
     )
 
     target_compile_features(${name} PRIVATE cxx_std_17)
